@@ -4,238 +4,193 @@ import net.minecraft.client.Minecraft;
 import net.minecraft.client.player.LocalPlayer;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.LivingEntity;
+import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.item.*;
 import net.minecraft.world.phys.Vec3;
+import net.minecraft.network.chat.Component;
 import net.minecraft.world.phys.AABB;
-import net.minecraft.core.BlockPos;
-import net.minecraft.world.InteractionHand;
+import net.minecraftforge.api.distmarker.Dist;
+import net.minecraftforge.api.distmarker.OnlyIn;
+import net.minecraftforge.client.event.InputEvent;
 import net.minecraftforge.common.MinecraftForge;
 import net.minecraftforge.event.TickEvent;
-import net.minecraftforge.event.entity.living.LivingDeathEvent;
 import net.minecraftforge.eventbus.api.SubscribeEvent;
 import net.minecraftforge.fml.common.Mod;
+import net.minecraft.client.KeyMapping;
 
-import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Random;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 
 @Mod(highhelper.MOD_ID)
+@OnlyIn(Dist.CLIENT)
 public class highhelper {
     public static final String MOD_ID = "highhelper";
-    private static final double DETECTION_RADIUS = 8.0;
-    private static final double ATTACK_RANGE = 3.0;
-    private static final float ROTATION_SPEED = 0.4f;
-    private static final float KILL_ROTATION_SPEED = 0.4f;
-    private static final int MIN_JUMP_COOLDOWN = 10;
-    private static final int MAX_JUMP_COOLDOWN = 20;
-    private static final int BASE_AUTOCLICKER_COOLDOWN = 10;
-    private static final int POST_KILL_DELAY = 5;
-    private static final double FRONT_FOV_ANGLE = Math.toRadians(60);
-    private static final double REAR_FOV_ANGLE = Math.toRadians(120);
+    private static final double DETECTION_RADIUS = 10.0;
+    private static final double ATTACK_DISTANCE = 3.5;
+    private static final float MIN_SMOOTH_FACTOR = 0.1f;
+    private static final float MAX_SMOOTH_FACTOR = 0.3f;
+    private static final int MIN_ATTACK_DELAY_TICKS = 2;
+    private static final int MAX_ATTACK_DELAY_TICKS = 5;
+    private static final int MAX_EXTRA_PAUSE_TICKS = 10;
+    private static final int TARGET_SELECTION_RANDOMNESS = 3;
 
-    private static final Random random = new Random();
-    private static int jumpCooldownCounter = 0;
-    private static LivingEntity currentTarget = null;
-    private static int autoClickerCooldown = 0;
-    private static boolean isPanningAfterKill = false;
-    private static int postKillDelayCounter = 0;
-    private static Vec3 targetPoint;
-    private static Vec3 killedMobCenter;
-    private static boolean checkingRearMobs = false;
+    private LivingEntity currentTarget = null;
+    private boolean isActive = false;
+    private final Random random = new Random();
+    private long lastAttackTime = 0;
+    private int attackDelayTicks = 0;
+    private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
 
     public highhelper() {
         MinecraftForge.EVENT_BUS.register(this);
     }
 
-    private void updateTargetPoint(Entity target) {
-        AABB boundingBox = target.getBoundingBox();
-        double randomX = boundingBox.minX + (boundingBox.maxX - boundingBox.minX) * (0.4 + random.nextDouble() * 0.2);
-        double randomY = boundingBox.minY + (boundingBox.maxY - boundingBox.minY) * (0.4 + random.nextDouble() * 0.2);
-        double randomZ = boundingBox.minZ + (boundingBox.maxZ - boundingBox.minZ) * (0.4 + random.nextDouble() * 0.2);
-        targetPoint = new Vec3(randomX, randomY, randomZ);
+    @SubscribeEvent
+    public void onKeyInput(InputEvent.Key event) {
+        if (event.getKey() == 72 && event.getAction() == 1) { // 72 is 'H' key
+            toggleMod();
+        }
+    }
+
+    private void toggleMod() {
+        isActive = !isActive;
+        Minecraft.getInstance().player.displayClientMessage(
+                Component.literal("HighHelper " + (isActive ? "activated" : "deactivated")), false);
     }
 
     @SubscribeEvent
     public void onClientTick(TickEvent.ClientTickEvent event) {
-        if (event.phase != TickEvent.Phase.END) return;
+        if (event.phase != TickEvent.Phase.END || !isActive) return;
 
-        Minecraft mc = Minecraft.getInstance();
-        LocalPlayer player = mc.player;
+        LocalPlayer player = Minecraft.getInstance().player;
+        if (player == null || !isHoldingWeapon(player)) return;
 
-        if (player == null || mc.level == null) return;
+        handleCombat(player);
+    }
 
-        // Update cooldowns
-        if (jumpCooldownCounter > 0) {
-            jumpCooldownCounter--;
-        }
-        if (autoClickerCooldown > 0) {
-            autoClickerCooldown--;
-        }
-
-        if (isPanningAfterKill) {
-            if (panCameraToKilledMob(player)) {
-                isPanningAfterKill = false;
-                killedMobCenter = null;
-                postKillDelayCounter = POST_KILL_DELAY;
-            }
-            return; // Skip other processing while panning
-        }
-
-        if (postKillDelayCounter > 0) {
-            postKillDelayCounter--;
-            return; // Skip processing during post-kill delay
-        }
-
-        if (isHoldingWeapon(player)) {
-            List<LivingEntity> nearbyMobs;
-            if (!checkingRearMobs) {
-                nearbyMobs = findNearbyMobsInFOV(player, FRONT_FOV_ANGLE);
-                if (nearbyMobs.isEmpty()) {
-                    checkingRearMobs = true;
-                }
-            } else {
-                nearbyMobs = findNearbyMobsInFOV(player, REAR_FOV_ANGLE);
-                if (nearbyMobs.isEmpty()) {
-                    checkingRearMobs = false;
-                }
-            }
-
-            if (!nearbyMobs.isEmpty()) {
-                currentTarget = selectClosestTarget(player, nearbyMobs);
-                updateTargetPoint(currentTarget);
-                rotateTowardsTargetPoint(player, ROTATION_SPEED);
-                moveTowardsTarget(player, currentTarget);
-
-                // Attack if in range
-                if (player.distanceTo(currentTarget) <= ATTACK_RANGE) {
-                    autoClicker(mc, player, nearbyMobs.size());
-                }
-            } else {
-                currentTarget = null;
-                player.setSprinting(false);
-            }
+    private void handleCombat(LocalPlayer player) {
+        if (currentTarget == null || !currentTarget.isAlive() || !isTargetInRange(player, currentTarget)) {
+            findNewTarget(player);
+        } else {
+            rotateTowardsTarget(player);
+            attackTarget(player);
         }
     }
 
-    @SubscribeEvent
-    public void onLivingDeath(LivingDeathEvent event) {
-        if (event.getEntity() == currentTarget) {
-            isPanningAfterKill = true;
-            AABB boundingBox = currentTarget.getBoundingBox();
-            killedMobCenter = new Vec3(
-                    (boundingBox.minX + boundingBox.maxX) / 2,
-                    (boundingBox.minY + boundingBox.maxY) / 2,
-                    (boundingBox.minZ + boundingBox.maxZ) / 2
-            );
-            currentTarget = null;
-        }
-    }
+    private void findNewTarget(LocalPlayer player) {
+        AABB searchBox = player.getBoundingBox().inflate(DETECTION_RADIUS);
+        List<Entity> nearbyEntities = player.level().getEntities(player, searchBox);
 
-    private boolean panCameraToKilledMob(LocalPlayer player) {
-        if (killedMobCenter == null) return true;
-
-        Vec3 playerEyes = player.getEyePosition();
-        Vec3 toTarget = killedMobCenter.subtract(playerEyes);
-
-        double horizontalDistance = Math.sqrt(toTarget.x * toTarget.x + toTarget.z * toTarget.z);
-        float targetYaw = (float) Math.toDegrees(Math.atan2(-toTarget.x, toTarget.z));
-        float targetPitch = (float) -Math.toDegrees(Math.atan2(toTarget.y, horizontalDistance));
-
-        // Prevent camera from pointing downwards
-        targetPitch = Math.min(targetPitch, 0);
-
-        float yawDifference = targetYaw - player.getYRot();
-        float pitchDifference = targetPitch - player.getXRot();
-
-        while (yawDifference < -180) yawDifference += 360;
-        while (yawDifference > 180) yawDifference -= 360;
-
-        player.setYRot(player.getYRot() + yawDifference * KILL_ROTATION_SPEED);
-        player.setXRot(player.getXRot() + pitchDifference * KILL_ROTATION_SPEED);
-
-        // Check if the camera is close enough to the target rotation
-        return Math.abs(yawDifference) < 1 && Math.abs(pitchDifference) < 1;
-    }
-
-    private boolean isHoldingWeapon(LocalPlayer player) {
-        Item heldItem = player.getMainHandItem().getItem();
-        return heldItem instanceof SwordItem || heldItem instanceof AxeItem || heldItem instanceof BowItem || heldItem instanceof CrossbowItem;
-    }
-
-    private List<LivingEntity> findNearbyMobsInFOV(LocalPlayer player, double fovAngle) {
-        List<LivingEntity> nearbyMobs = new ArrayList<>();
-        Vec3 playerLook = player.getLookAngle();
-
-        for (Entity entity : player.level().getEntities(player, player.getBoundingBox().inflate(DETECTION_RADIUS))) {
-            if (entity instanceof LivingEntity && !(entity instanceof LocalPlayer) && entity.isAlive()) {
-                Vec3 toEntity = entity.position().subtract(player.position()).normalize();
-                double angle = Math.acos(playerLook.dot(toEntity));
-
-                if (angle <= fovAngle) {
-                    nearbyMobs.add((LivingEntity) entity);
-                }
-            }
-        }
-        return nearbyMobs;
-    }
-
-    private LivingEntity selectClosestTarget(LocalPlayer player, List<LivingEntity> nearbyMobs) {
-        return nearbyMobs.stream()
-                .min(Comparator.comparingDouble(player::distanceToSqr))
+        // Randomly choose one of the closest entities, not always the absolute closest
+        currentTarget = nearbyEntities.stream()
+                .filter(e -> e instanceof LivingEntity && !(e instanceof Player) && e.isAlive())
+                .map(e -> (LivingEntity) e)
+                .sorted(Comparator.comparingDouble(player::distanceToSqr))
+                .skip(random.nextInt(TARGET_SELECTION_RANDOMNESS))
+                .findFirst()
                 .orElse(null);
     }
 
-    private void rotateTowardsTargetPoint(LocalPlayer player, float rotationSpeed) {
-        if (targetPoint == null) return;
+    private void rotateTowardsTarget(LocalPlayer player) {
+        if (currentTarget == null) return;
 
-        Vec3 playerEyes = player.getEyePosition();
-        Vec3 toTarget = targetPoint.subtract(playerEyes);
+        Vec3 toTarget = currentTarget.position().add(0, currentTarget.getBbHeight() * 0.5, 0)
+                .subtract(player.getEyePosition());
 
         double horizontalDistance = Math.sqrt(toTarget.x * toTarget.x + toTarget.z * toTarget.z);
         float targetYaw = (float) Math.toDegrees(Math.atan2(-toTarget.x, toTarget.z));
         float targetPitch = (float) -Math.toDegrees(Math.atan2(toTarget.y, horizontalDistance));
 
-        // Prevent camera from pointing downwards
-        targetPitch = Math.min(targetPitch, 0);
+        // Increase randomness in rotation
+        targetYaw += (random.nextFloat() - 0.5f) * 5f;
+        targetPitch += (random.nextFloat() - 0.5f) * 3f;
 
-        float yawDifference = targetYaw - player.getYRot();
-        float pitchDifference = targetPitch - player.getXRot();
-
-        while (yawDifference < -180) yawDifference += 360;
-        while (yawDifference > 180) yawDifference -= 360;
-
-        player.setYRot(player.getYRot() + yawDifference * rotationSpeed);
-        player.setXRot(player.getXRot() + pitchDifference * rotationSpeed);
+        player.setYRot(smoothRotation(player.getYRot(), targetYaw));
+        player.setXRot(smoothRotation(player.getXRot(), targetPitch));
     }
 
-    private void moveTowardsTarget(LocalPlayer player, Entity target) {
-        Vec3 playerPos = player.position();
-        Vec3 targetPos = target.position();
-        Vec3 movement = targetPos.subtract(playerPos).normalize();
+    private float smoothRotation(float current, float target) {
+        float difference = wrapAngleTo180(target - current);
+        // Randomize the smooth factor for each rotation
+        float smoothFactor = MIN_SMOOTH_FACTOR + random.nextFloat() * (MAX_SMOOTH_FACTOR - MIN_SMOOTH_FACTOR);
+        return current + difference * smoothFactor;
+    }
 
-        player.setDeltaMovement(movement.x, player.getDeltaMovement().y, movement.z);
-        player.setSprinting(true);
+    private float wrapAngleTo180(float angle) {
+        angle %= 360.0F;
+        if (angle >= 180.0F) {
+            angle -= 360.0F;
+        } else if (angle < -180.0F) {
+            angle += 360.0F;
+        }
+        return angle;
+    }
 
-        // Jump if there's a block in front of the player
-        if (jumpCooldownCounter <= 0 && isBlockInFront(player)) {
-            player.jumpFromGround();
-            jumpCooldownCounter = MIN_JUMP_COOLDOWN + random.nextInt(MAX_JUMP_COOLDOWN - MIN_JUMP_COOLDOWN + 1);
+    private void attackTarget(LocalPlayer player) {
+        if (canAttack(player) && isTargetInRange(player, currentTarget)) {
+            if (attackDelayTicks <= 0) {
+                // Randomly decide whether to attack or wait
+                if (random.nextInt(10) > 2) {
+                    simulateAttack(player);
+                    lastAttackTime = System.currentTimeMillis();
+                    attackDelayTicks = random.nextInt(MAX_ATTACK_DELAY_TICKS + 1);
+                } else {
+                    attackDelayTicks = random.nextInt(MAX_EXTRA_PAUSE_TICKS);
+                }
+            } else {
+                attackDelayTicks--;
+            }
         }
     }
 
-    private boolean isBlockInFront(LocalPlayer player) {
-        Vec3 playerPos = player.position();
-        Vec3 lookVec = player.getLookAngle();
-        Vec3 checkPos = playerPos.add(lookVec.x, 0, lookVec.z);
-        return !player.level().getBlockState(new BlockPos((int) checkPos.x, (int) playerPos.y, (int) checkPos.z)).isAir();
+    private void simulateAttack(LocalPlayer player) {
+        Minecraft mc = Minecraft.getInstance();
+        KeyMapping attackKey = mc.options.keyAttack;
+
+        int attackDelay = 50 + random.nextInt(150); // Random delay between 50ms and 200ms
+        scheduler.schedule(() -> {
+            mc.execute(() -> {
+                KeyMapping.click(attackKey.getKey());
+
+                try {
+                    Thread.sleep(20 + random.nextInt(50)); // Hold for 20-70ms
+                } catch (InterruptedException e) {
+                    e.printStackTrace();
+                }
+
+                KeyMapping.set(attackKey.getKey(), false);
+            });
+        }, attackDelay, TimeUnit.MILLISECONDS);
     }
 
-    private void autoClicker(Minecraft mc, LocalPlayer player, int mobCount) {
-        if (autoClickerCooldown <= 0) {
-            mc.gameMode.attack(player, currentTarget);
-            player.swing(InteractionHand.MAIN_HAND);
-            autoClickerCooldown = Math.max(1, BASE_AUTOCLICKER_COOLDOWN - mobCount);
+    private boolean canAttack(LocalPlayer player) {
+        long currentTime = System.currentTimeMillis();
+        float attackSpeed = (float) player.getAttributeValue(net.minecraft.world.entity.ai.attributes.Attributes.ATTACK_SPEED);
+        long attackCooldown = (long) (1000 / attackSpeed);
+        return currentTime - lastAttackTime >= attackCooldown;
+    }
+
+    private boolean isTargetInRange(LocalPlayer player, LivingEntity target) {
+        return player.distanceTo(target) <= ATTACK_DISTANCE;
+    }
+
+    private boolean isHoldingWeapon(Player player) {
+        Item heldItem = player.getMainHandItem().getItem();
+        return heldItem instanceof SwordItem || heldItem instanceof AxeItem;
+    }
+
+    public void cleanup() {
+        scheduler.shutdown();
+        try {
+            if (!scheduler.awaitTermination(800, TimeUnit.MILLISECONDS)) {
+                scheduler.shutdownNow();
+            }
+        } catch (InterruptedException e) {
+            scheduler.shutdownNow();
         }
     }
 }
